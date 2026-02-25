@@ -1,16 +1,18 @@
 import os
 import re
+import json
 import time
 import logging
 import requests
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from tqdm import tqdm
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 BASE_URL    = "https://dharmaebooks.org/tag/tibetan/"
 HEADERS     = {"User-Agent": "Mozilla/5.0 (compatible; DharmaEbookScraper/1.0)"}
-CRAWL_DELAY = 3          # seconds between requests (respect robots.txt guidance)
+CRAWL_DELAY = 2          # seconds between requests (be polite)
 DATA_DIR    = "data"
 EPUB_DIR    = os.path.join(DATA_DIR, "epub")
 PDF_DIR     = os.path.join(DATA_DIR, "pdf")
@@ -30,26 +32,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def safe_get(url: str) -> requests.Response | None:
-    """GET a URL with error handling; returns None on failure."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
         time.sleep(CRAWL_DELAY)
         return r
     except requests.RequestException as e:
-        log.error(f"Request failed for {url}: {e}")
+        log.error(f"Request failed — {url}: {e}")
         return None
-
-
-def slugify(text: str) -> str:
-    """Convert a book title to a safe filename-friendly slug."""
-    # Keep ASCII alphanumerics, replace everything else with '-'
-    slug = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
-    slug = re.sub(r"[\s_-]+", "-", slug).strip("-")
-    return slug[:80]  # cap length
 
 
 def get_soup(url: str) -> BeautifulSoup | None:
@@ -57,123 +50,199 @@ def get_soup(url: str) -> BeautifulSoup | None:
     return BeautifulSoup(r.text, "html.parser") if r else None
 
 
-# ── Core scraping logic ────────────────────────────────────────────────────────
+def slugify(text: str) -> str:
+    """Safe ASCII slug for filenames (max 80 chars)."""
+    slug = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    slug = re.sub(r"[\s_-]+", "-", slug).strip("-")
+    return slug[:80] or "untitled"
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Metadata extraction ────────────────────────────────────────────────────────
+
+def extract_metadata(book_url: str) -> dict:
+    """
+    Visit a book's individual page and extract every available metadata field.
+
+    Fields extracted:
+      title           — main <h1> heading (Tibetan script)
+      subtitle        — English translation in parentheses below title
+      author          — credited author line below subtitle
+      date_published  — ISO date string (e.g. "2025-10-14")
+      tags            — all /tag/ hrefs on the page (language, Karmapa refs, etc.)
+      category        — WordPress /category/ label (e.g. "Philosophy", "History")
+      language        — always "Tibetan" for this corpus
+      cover_image_url — og:image meta tag (highest quality)
+      description     — first long body paragraph (Tibetan blurb)
+      source_url      — canonical URL of the book page
+      epub_url        — direct /download link for EPUB
+      pdf_url         — direct /download link for PDF
+    """
+    meta = {
+        "title":           None,
+        "subtitle":        None,
+        "author":          None,
+        "date_published":  None,
+        "tags":            [],
+        "category":        None,
+        "language":        "Tibetan",
+        "cover_image_url": None,
+        "description":     None,
+        "source_url":      book_url,
+        "epub_url":        None,
+        "pdf_url":         None,
+    }
+
+    soup = get_soup(book_url)
+    if not soup:
+        return meta
+
+    # ── Title ──────────────────────────────────────────────────────────────────
+    h1 = soup.find("h1")
+    if h1:
+        meta["title"] = h1.get_text(strip=True)
+
+    # ── Subtitle + Author ──────────────────────────────────────────────────────
+    # The book page structure just below the title:
+    #   <p>Tibetan subtitle line\n(English subtitle in parentheses)</p>
+    #   <p>Author name(s)</p>
+    #   <p>[PDF link]  [EPUB link]</p>
+    # We scan the first 8 paragraphs to find these fields.
+    content_area = soup.find("div", class_=re.compile(r"entry-content|post-content", re.I))
+    if not content_area:
+        content_area = soup.find("article") or soup
+
+    paragraphs = content_area.find_all("p") if content_area else soup.find_all("p")
+    found_subtitle = False
+
+    for p in paragraphs[:10]:
+        text = p.get_text(" ", strip=True)
+        if not text:
+            continue
+
+        # Subtitle — line containing English translation in parens
+        if not meta["subtitle"] and "(" in text and ")" in text and len(text) < 300:
+            # Extract just the parenthesised part as the subtitle
+            match = re.search(r"\(([^)]{10,})\)", text)
+            if match:
+                meta["subtitle"] = match.group(1).strip()
+                found_subtitle = True
+            continue
+
+        # Author — short line after subtitle, before the description block
+        if (
+            found_subtitle
+            and not meta["author"]
+            and text
+            and len(text) < 200
+            and "EPUB" not in text.upper()
+            and "PDF"  not in text.upper()
+        ):
+            meta["author"] = text
+            continue
+
+        # Description — first substantial block of body text
+        if not meta["description"] and len(text) > 120:
+            meta["description"] = text
+
+    # ── Download links ─────────────────────────────────────────────────────────
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(strip=True).upper()
+        href  = urljoin(book_url, a["href"])
+        if label == "EPUB" and not meta["epub_url"]:
+            meta["epub_url"] = href
+        elif label == "PDF" and not meta["pdf_url"]:
+            meta["pdf_url"]  = href
+
+    # ── Date published ─────────────────────────────────────────────────────────
+    # Rendered as plain text "YYYY-MM-DD" near the tag badges
+    date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", soup.get_text())
+    if date_match:
+        meta["date_published"] = date_match.group(1)
+
+    # ── Tags ──────────────────────────────────────────────────────────────────
+    seen_tags = set()
+    for a in soup.find_all("a", href=True):
+        if "/tag/" in a["href"]:
+            tag = a.get_text(strip=True)
+            if tag and tag not in seen_tags:
+                meta["tags"].append(tag)
+                seen_tags.add(tag)
+
+    # ── Category ──────────────────────────────────────────────────────────────
+    for a in soup.find_all("a", href=True):
+        if "/category/" in a["href"]:
+            meta["category"] = a.get_text(strip=True)
+            break
+
+    # ── Cover image ────────────────────────────────────────────────────────────
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        meta["cover_image_url"] = og["content"]
+    else:
+        img = soup.find("img", src=re.compile(r"uploads", re.I))
+        if img:
+            meta["cover_image_url"] = img.get("src") or img.get("data-src")
+
+    return meta
+
+
+# ── Listing-page helpers ───────────────────────────────────────────────────────
 
 def get_page_url(page: int) -> str:
-    """
-    Page 1  → https://dharmaebooks.org/tag/tibetan/
-    Page 2+ → https://dharmaebooks.org/tag/tibetan/page/2/
-    """
-    if page == 1:
-        return BASE_URL
-    return f"{BASE_URL}page/{page}/"
+    """Page 1 uses the base URL; subsequent pages use /page/N/."""
+    return BASE_URL if page == 1 else f"{BASE_URL}page/{page}/"
 
 
-def extract_books_from_listing(soup: BeautifulSoup, page_url: str) -> list[dict]:
-    """
-    Pull book entries directly from the tag listing page.
-
-    Each <article> contains:
-      - The book title in an <h3> or <h2> <a>
-      - Direct EPUB / PDF download links as anchor text "EPUB" / "PDF"
-
-    FIX #1 & #2: We detect links by their *visible text* ("EPUB"/"PDF"),
-    not by file extension.  The real URLs end in /download — no extension.
-    """
-    books = []
-
+def get_book_links(soup: BeautifulSoup, page_url: str) -> list[dict]:
+    """Extract {title, book_page} for every article on a listing page."""
+    entries = []
     for article in soup.find_all("article"):
-        # ── Title ──────────────────────────────────────────────────────────
         title_tag = article.find(["h2", "h3"])
-        title = title_tag.get_text(strip=True) if title_tag else "untitled"
-
-        # ── Download links ─────────────────────────────────────────────────
-        epub_url = None
-        pdf_url  = None
-
-        for a in article.find_all("a", href=True):
-            link_text = a.get_text(strip=True).upper()
-            href = urljoin(page_url, a["href"])
-
-            if link_text == "EPUB" and epub_url is None:
-                epub_url = href
-            elif link_text == "PDF" and pdf_url is None:
-                pdf_url = href
-
-        if epub_url or pdf_url:
-            books.append({
-                "title":    title,
-                "epub_url": epub_url,
-                "pdf_url":  pdf_url,
+        title     = title_tag.get_text(strip=True) if title_tag else "untitled"
+        link_tag  = article.find("a", href=True)
+        if link_tag:
+            entries.append({
+                "title":     title,
+                "book_page": urljoin(page_url, link_tag["href"]),
             })
-        else:
-            # Fall back: visit individual book page
-            book_link_tag = article.find("a", href=True)
-            if book_link_tag:
-                books.append({
-                    "title":     title,
-                    "epub_url":  None,
-                    "pdf_url":   None,
-                    "book_page": urljoin(page_url, book_link_tag["href"]),
-                })
-
-    log.info(f"  → Found {len(books)} book entries on this page")
-    return books
+    return entries
 
 
-def resolve_book_page(book: dict) -> dict:
-    """
-    FIX #1 applied to individual book pages:
-    Detect EPUB/PDF links by anchor text, not file extension.
-    """
-    url = book.get("book_page")
-    if not url:
-        return book
-
-    log.info(f"  Visiting book page: {url}")
-    soup = get_soup(url)
-    if not soup:
-        return book
-
-    for a in soup.find_all("a", href=True):
-        link_text = a.get_text(strip=True).upper()
-        href = urljoin(url, a["href"])
-
-        if link_text == "EPUB" and not book["epub_url"]:
-            book["epub_url"] = href
-        elif link_text == "PDF" and not book["pdf_url"]:
-            book["pdf_url"] = href
-
-    return book
-
-
-def choose_file(book: dict) -> tuple[str | None, str | None]:
-    """
-    Apply priority: EPUB first, PDF as fallback.
-    Returns (url, format_label) or (None, None).
-    """
-    if book.get("epub_url"):
-        return book["epub_url"], "epub"
-    if book.get("pdf_url"):
-        return book["pdf_url"], "pdf"
-    return None, None
-
-
-def download_file(url: str, title: str, fmt: str) -> bool:
-    """
-    FIX #3: Build a descriptive filename from title + format.
-    FIX #4: Stream the download in chunks.
-    """
-    slug      = slugify(title)
-    filename  = f"{slug}.{fmt}"
-    out_dir   = EPUB_DIR if fmt == "epub" else PDF_DIR
-    filepath  = os.path.join(out_dir, filename)
-
-    if os.path.exists(filepath):
-        log.info(f"  [SKIP] Already exists: {filename}")
+def has_next_page(soup):
+    # 1. <link rel="next"> in <head>  ← WordPress always adds this
+    if soup.find("link", rel="next"):
         return True
 
-    log.info(f"  [DOWNLOADING] {filename}")
+    # 2. Any <a href> containing /page/N/  ← structural, never breaks
+    for a in soup.find_all("a", href=True):
+        if re.search(r"/page/\d+/", a["href"]):
+            return True
+
+    # 3. .get_text() to read through child tags  ← catches "Next" regardless
+    for a in soup.find_all("a", href=True):
+        if re.search(r"next|›|»", a.get_text(), re.I):
+            return True
+
+    return False
+
+
+# ── Download helpers ───────────────────────────────────────────────────────────
+
+def download_file(url: str, slug: str, fmt: str) -> tuple[bool, str]:
+    """Stream-download to data/epub/ or data/pdf/. Returns (success, filepath)."""
+    out_dir  = EPUB_DIR if fmt == "epub" else PDF_DIR
+    filename = f"{slug}.{fmt}"
+    filepath = os.path.join(out_dir, filename)
+
+    if os.path.exists(filepath):
+        log.info(f"    [SKIP] Already on disk: {filename}")
+        return True, filepath
+
+    log.info(f"    [DOWNLOAD] {filename}")
     try:
         with requests.get(url, headers=HEADERS, stream=True, timeout=60) as r:
             r.raise_for_status()
@@ -183,92 +252,107 @@ def download_file(url: str, title: str, fmt: str) -> bool:
                     r.iter_content(chunk_size=8192),
                     total=total // 8192 or None,
                     unit="KB",
-                    desc=slug[:40],
+                    desc=filename[:40],
                     leave=False,
                 ):
                     if chunk:
                         f.write(chunk)
-        log.info(f"  [SAVED] {filepath}")
-        return True
+        log.info(f"    [SAVED] {filepath}")
+        return True, filepath
     except requests.RequestException as e:
-        log.error(f"  [FAILED] {filename}: {e}")
+        log.error(f"    [FAILED] {filename}: {e}")
         if os.path.exists(filepath):
-            os.remove(filepath)   # clean up partial file
-        return False
+            os.remove(filepath)   # remove partial file
+        return False, filepath
 
 
-# ── Has-next-page check ────────────────────────────────────────────────────────
+def save_meta_json(meta: dict, slug: str, fmt: str) -> None:
+    """Write <slug>.meta.json sidecar alongside the ebook file."""
+    out_dir   = EPUB_DIR if fmt == "epub" else PDF_DIR
+    json_path = os.path.join(out_dir, f"{slug}.meta.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    log.info(f"    [META] Saved → {json_path}")
 
-def has_next_page(soup: BeautifulSoup) -> bool:
-    """Return True if a 'Next' pagination link exists."""
-    return bool(soup.find("a", string=re.compile(r"next|›|»", re.I)))
 
-
-# ── Main entry point ───────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def scrape(max_pages: int = 999):
     """
-    Scrape up to `max_pages` pages of the Tibetan tag.
-    Set max_pages=1 for a quick test run.
+    Scrape all pages of the Tibetan tag listing.
+    max_pages=999 means "run until no next page" (site has ~6 pages / 136 books).
+    Pass max_pages=1 for a quick single-page test.
     """
-    stats = {"attempted": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+    stats = {"total": 0, "downloaded": 0, "failed": 0}
 
     for page in range(1, max_pages + 1):
         page_url = get_page_url(page)
         log.info(f"\n{'='*60}")
-        log.info(f"PAGE {page}: {page_url}")
+        log.info(f"PAGE {page}  —  {page_url}")
         log.info(f"{'='*60}")
 
         soup = get_soup(page_url)
         if soup is None:
-            log.warning(f"Could not load page {page}. Stopping.")
+            log.warning("Could not fetch page. Stopping.")
             break
 
-        books = extract_books_from_listing(soup, page_url)
-        if not books:
-            log.info("No books found on this page. Stopping pagination.")
+        entries = get_book_links(soup, page_url)
+        if not entries:
+            log.info("No books found on page. Stopping pagination.")
             break
 
-        for book in books:
-            log.info(f"\n  Book: {book['title'][:80]}")
+        log.info(f"  {len(entries)} books found")
 
-            # Resolve via individual page only if needed
-            if not book.get("epub_url") and not book.get("pdf_url"):
-                book = resolve_book_page(book)
+        for entry in entries:
+            stats["total"] += 1
+            log.info(f"\n  [{stats['total']}] {entry['title'][:70]}")
 
-            file_url, fmt = choose_file(book)
+            # Full metadata from the individual book page
+            meta = extract_metadata(entry["book_page"])
+            if not meta["title"]:
+                meta["title"] = entry["title"]
 
-            if not file_url:
-                log.warning("  [NO FILE] No EPUB or PDF found.")
+            # Priority: EPUB first, PDF fallback
+            if meta["epub_url"]:
+                file_url, fmt = meta["epub_url"], "epub"
+            elif meta["pdf_url"]:
+                file_url, fmt = meta["pdf_url"], "pdf"
+            else:
+                log.warning("    [SKIP] No downloadable file found.")
                 stats["failed"] += 1
                 continue
 
-            log.info(f"  Format selected: {fmt.upper()}")
-            stats["attempted"] += 1
+            log.info(f"    Format : {fmt.upper()}")
+            slug = slugify(meta["title"])
 
-            ok = download_file(file_url, book["title"], fmt)
+            # Download the ebook
+            ok, filepath = download_file(file_url, slug, fmt)
+
+            # Always write meta.json (even on skip — keeps metadata fresh)
+            meta["downloaded_format"]   = fmt
+            meta["downloaded_filename"] = os.path.basename(filepath)
+            meta["scraped_at"]          = now_utc()
+            save_meta_json(meta, slug, fmt)
+
             if ok:
-                if "SKIP" in open(LOG_FILE, encoding="utf-8").read().split("\n")[-3]:
-                    stats["skipped"] += 1
-                else:
-                    stats["downloaded"] += 1
+                stats["downloaded"] += 1
             else:
                 stats["failed"] += 1
 
         if not has_next_page(soup):
-            log.info("No next page found. Scraping complete.")
+            log.info("\nNo further pages — scraping complete.")
             break
 
+    # ── Final summary ──────────────────────────────────────────────────────────
     log.info(f"\n{'='*60}")
-    log.info("FINAL STATS")
-    log.info(f"  Attempted : {stats['attempted']}")
-    log.info(f"  Downloaded: {stats['downloaded']}")
-    log.info(f"  Skipped   : {stats['skipped']}  (already on disk)")
-    log.info(f"  Failed    : {stats['failed']}")
-    log.info(f"  Output dirs: {os.path.abspath(EPUB_DIR)}  (epub)")
-    log.info(f"               {os.path.abspath(PDF_DIR)}   (pdf)")
+    log.info("SCRAPE COMPLETE")
+    log.info(f"  Total books  : {stats['total']}")
+    log.info(f"  Downloaded   : {stats['downloaded']}")
+    log.info(f"  Failed/missed: {stats['failed']}")
+    log.info(f"  EPUB dir     : {os.path.abspath(EPUB_DIR)}")
+    log.info(f"  PDF dir      : {os.path.abspath(PDF_DIR)}")
+    log.info(f"  Log file     : {os.path.abspath(LOG_FILE)}")
 
 
 if __name__ == "__main__":
-    # Change max_pages to a higher number (or remove the arg) to scrape all pages
-    scrape(max_pages=1)
+    scrape()   # runs all pages by default
