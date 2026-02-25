@@ -84,4 +84,12 @@ Activity is logged to:
 
 To limit the number of pages extracted, modify the `scrape()` function call in `scraper.py`. Use the `max_pages` parameter to control how many pages are crawled (e.g., `scrape(max_pages=1)` to extract only the first page, or increase the value for more pages).
 
+## 📦 Download Dataset
+
+You can download the latest version of the Tibetan Ebooks Corpus here:
+
+👉 [Download Latest Release](https://github.com/sudhanshu-dharma/Dharma-Ebook-Scraper/releases/tag/v1.0.0)
+
+Current release: **v1.0.0**  
+Includes 120 books with `meta.json`, scraped from dharmaebooks.org.
 
