@@ -91,7 +91,6 @@ To limit the number of pages extracted, modify the `scrape()` function call in `
 - **v2.0.0**
 - File: tibetan-ebooks-corpus_v2.zip
 - Includes additional books and improved metadata
-- Download: https://github.com/sudhanshu-dharma/Dharma-Ebook-Scraper/releases/tag/v2.0.0
-- 
+- [Download]: (https://github.com/sudhanshu-dharma/Dharma-Ebook-Scraper/releases/tag/v2.0.0)
 Includes 127 books with `meta.json`, scraped from dharmaebooks.org.
 
