@@ -86,10 +86,12 @@ To limit the number of pages extracted, modify the `scrape()` function call in `
 
 ## 📦 Download Dataset
 
-You can download the latest version of the Tibetan Ebooks Corpus here:
+## Latest Dataset Release
 
-👉 [Download Latest Release](https://github.com/sudhanshu-dharma/Dharma-Ebook-Scraper/releases/tag/v1.0.0)
-
-Current release: **v1.0.0**  
-Includes 120 books with `meta.json`, scraped from dharmaebooks.org.
+- **v2.0.0**
+- File: tibetan-ebooks-corpus_v2.zip
+- Includes additional books and improved metadata
+- Download: https://github.com/sudhanshu-dharma/Dharma-Ebook-Scraper/releases/tag/v2.0.0
+- 
+Includes 127 books with `meta.json`, scraped from dharmaebooks.org.
 
